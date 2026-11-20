@@ -258,6 +258,151 @@ impl ResolutionContract {
         Ok(status)
     }
 
+    /// Resolve a market by retrieving its result from a specific oracle address.
+    ///
+    /// Unlike [`resolve_market`], which uses the single pre-configured oracle contract
+    /// opaquely, this entry-point lets the resolver name the oracle address explicitly.
+    /// Before fetching any result the oracle address is validated against the registry
+    /// maintained by the stored `OracleContract` by calling its `list_oracles` entrypoint.
+    /// If the address is not found in that list the call is rejected with
+    /// [`ContractError::OracleNotRegistered`], preventing a malicious caller from
+    /// pointing the resolution at an oracle contract they control.
+    pub fn resolve_market_with_oracles(
+        env: Env,
+        resolver: Address,
+        market_id: u32,
+        oracle: Address,
+    ) -> Result<ResolutionStatus, ContractError> {
+        resolver.require_auth();
+        if env.storage().persistent().has(&DataKey::Admin) {
+            Self::extend_ttl(&env, &DataKey::Admin, COOLDOWN_TTL_LEDGERS);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ResolutionStatus(market_id))
+        {
+            return Err(ContractError::MarketAlreadyResolved);
+        }
+
+        let markets_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MarketsContract)
+            .ok_or(ContractError::InvalidState)?;
+        Self::extend_ttl(&env, &DataKey::MarketsContract, COOLDOWN_TTL_LEDGERS);
+
+        let oracle_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleContract)
+            .ok_or(ContractError::InvalidState)?;
+        Self::extend_ttl(&env, &DataKey::OracleContract, COOLDOWN_TTL_LEDGERS);
+
+        // Validate that the caller-supplied oracle address appears in the registry
+        // maintained by the oracles contract. This prevents a caller from supplying
+        // an arbitrary address that impersonates a legitimate oracle.
+        let registered_oracles: Vec<Address> = match env
+            .try_invoke_contract::<Vec<Address>, soroban_sdk::Error>(
+                &oracle_contract,
+                &Symbol::new(&env, "list_oracles"),
+                soroban_sdk::vec![&env],
+            ) {
+            Ok(Ok(list)) => list,
+            _ => return Err(ContractError::InvalidState),
+        };
+        if !registered_oracles.contains(&oracle) {
+            return Err(ContractError::OracleNotRegistered);
+        }
+
+        let market = match env
+            .try_invoke_contract::<Option<(Address, u64, u32, bool, bool)>, soroban_sdk::Error>(
+                &markets_contract,
+                &Symbol::new(&env, "get_market_for_resolution"),
+                soroban_sdk::vec![&env, market_id.into()],
+            ) {
+            Ok(Ok(Some(market))) => market,
+            Ok(Ok(None)) => return Err(ContractError::MarketNotFound),
+            _ => return Err(ContractError::InvalidState),
+        };
+        let (market_creator, market_end_time, outcome_count, resolved, cancelled) = market;
+        if resolver != market_creator {
+            return Err(ContractError::Unauthorized);
+        }
+        if resolved {
+            return Err(ContractError::MarketAlreadyResolved);
+        }
+        if cancelled {
+            return Err(ContractError::InvalidState);
+        }
+        if env.ledger().timestamp() < market_end_time {
+            return Err(ContractError::MarketClosed);
+        }
+        Self::check_cooldown(&env, &resolver)?;
+
+        // Fetch the result from the validated oracle address, not the registry contract.
+        let winning_outcomes = match env
+            .try_invoke_contract::<Option<Vec<u32>>, soroban_sdk::Error>(
+                &oracle,
+                &Symbol::new(&env, "get_result"),
+                soroban_sdk::vec![&env, market_id.into()],
+            ) {
+            Ok(Ok(Some(result))) => result,
+            _ => return Err(ContractError::OracleResultNotAvailable),
+        };
+        if winning_outcomes.is_empty() {
+            return Err(ContractError::InvalidWinningOutcomes);
+        }
+        if winning_outcomes.len() > outcome_count {
+            return Err(ContractError::InvalidWinningOutcomes);
+        }
+        let mut seen = Map::<u32, bool>::new(&env);
+        for outcome in winning_outcomes.iter() {
+            if outcome >= outcome_count {
+                return Err(ContractError::InvalidOutcome);
+            }
+            if seen.contains_key(outcome) {
+                return Err(ContractError::InvalidWinningOutcomes);
+            }
+            seen.set(outcome, true);
+        }
+
+        env.invoke_contract::<()>(
+            &markets_contract,
+            &Symbol::new(&env, "resolve_market_with_outcomes"),
+            soroban_sdk::vec![
+                &env,
+                resolver.clone().into_val(&env),
+                market_id.into(),
+                winning_outcomes.clone().into(),
+            ],
+        );
+
+        let status = ResolutionStatus {
+            market_id,
+            winning_outcomes,
+            resolved_at: env.ledger().timestamp(),
+            oracle: oracle.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ResolutionStatus(market_id), &status);
+        Self::extend_ttl(
+            &env,
+            &DataKey::ResolutionStatus(market_id),
+            RESOLUTION_TTL_LEDGERS,
+        );
+
+        let cooldown_key = DataKey::LastResolution(resolver);
+        env.storage()
+            .persistent()
+            .set(&cooldown_key, &status.resolved_at);
+        Self::extend_ttl(&env, &cooldown_key, COOLDOWN_TTL_LEDGERS);
+
+        Ok(status)
+    }
+
     /// Return the recorded resolution details, if the market has been resolved.
     pub fn get_resolution_status(env: Env, market_id: u32) -> Option<ResolutionStatus> {
         let key = DataKey::ResolutionStatus(market_id);

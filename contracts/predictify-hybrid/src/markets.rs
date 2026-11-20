@@ -12,6 +12,12 @@ use crate::storage::{
 use crate::types::*;
 // Oracle imports removed - not currently used
 
+/// Maximum length, in bytes, of a market question.
+///
+/// Mirrors the documented contract API (1-500 characters) and keeps the stored
+/// question bounded, so metadata commitments remain cheap to compute and verify.
+pub const MAX_QUESTION_LENGTH: u32 = 500;
+
 /// Market management system for Predictify Hybrid contract
 ///
 /// This module provides a comprehensive market management system with:
@@ -43,7 +49,8 @@ impl MarketCreator {
     /// * `env` - The Soroban environment for blockchain operations
     /// * `admin` - Address of the market administrator (must have sufficient balance for fees)
     /// * `question` - The prediction question (1-500 characters, cannot be empty)
-    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum 10 outcomes)
+    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum
+    ///   [`OutcomeCapManager::get_max_outcomes`], default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `duration_days` - Market duration in days (1-365 days)
     /// * `oracle_config` - Oracle configuration specifying data source and resolution criteria
     ///
@@ -165,7 +172,8 @@ impl MarketCreator {
     /// * `_env` - The Soroban environment for blockchain operations
     /// * `admin` - Address of the market administrator
     /// * `question` - The prediction question (1-500 characters)
-    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum 10)
+    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum
+    ///   [`OutcomeCapManager::get_max_outcomes`], default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `duration_days` - Market duration in days (1-365 days)
     /// * `asset_symbol` - Reflector asset symbol (e.g., "BTC", "ETH", "XLM")
     /// * `threshold` - Price threshold for comparison (in asset's base units)
@@ -246,7 +254,8 @@ impl MarketCreator {
     /// * `_env` - The Soroban environment for blockchain operations
     /// * `admin` - Address of the market administrator
     /// * `question` - The prediction question (1-500 characters)
-    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum 10)
+    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum
+    ///   [`OutcomeCapManager::get_max_outcomes`], default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `duration_days` - Market duration in days (1-365 days)
     /// * `feed_id` - Pyth price feed identifier (e.g., "BTC/USD", "ETH/USD")
     /// * `threshold` - Price threshold for comparison (in feed's base units)
@@ -328,7 +337,8 @@ impl MarketCreator {
     /// * `_env` - The Soroban environment for blockchain operations
     /// * `admin` - Address of the market administrator
     /// * `question` - The prediction question (1-500 characters)
-    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum 10)
+    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum
+    ///   [`OutcomeCapManager::get_max_outcomes`], default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `duration_days` - Market duration in days (1-365 days)
     /// * `asset_symbol` - Specific asset symbol (e.g., "BTC", "ETH", "GOLD")
     /// * `threshold` - Price threshold for comparison (in asset's base units)
@@ -401,6 +411,111 @@ impl MarketCreator {
 /// This struct provides comprehensive validation functions for market creation,
 /// voting operations, and state transitions. All validation functions follow
 /// strict business rules to maintain platform integrity and user experience.
+// ===== OUTCOME COUNT LIMITS =====
+
+/// Default cap on the number of outcomes a market may declare.
+///
+/// This is the value the contract used to hard-code. It is now only the
+/// fallback used until governance calls
+/// [`OutcomeCapManager::set_max_outcomes`], so the effective cap can move
+/// without a contract upgrade.
+pub const DEFAULT_MAX_OUTCOMES_PER_MARKET: u32 = 10;
+
+/// Smallest cap an admin may configure.
+///
+/// A market needs at least two mutually exclusive outcomes for resolution and
+/// payout accounting to mean anything, so the cap can never go below two.
+pub const MIN_OUTCOMES_PER_MARKET: u32 = 2;
+
+/// Largest cap an admin may configure.
+///
+/// Resolution, disputed resolution and claiming all iterate the outcome list
+/// (`resolve_market`, `resolve_market_multiple`, `claim_winnings`). Bounding
+/// the configured cap keeps a single resolution inside the ledger's
+/// instruction budget and keeps the per-market record small, so a mistyped
+/// (or compromised) admin key cannot create markets that are too expensive to
+/// resolve.
+pub const MAX_OUTCOMES_PER_MARKET_CEILING: u32 = 20;
+
+/// Manages the runtime-configurable cap on outcomes per market.
+///
+/// The cap replaces the previously hard-coded `10` with a value stored in
+/// persistent storage under [`DataKey::MaxOutcomesPerMarket`], so governance
+/// can raise or lower it without redeploying the contract.
+pub struct OutcomeCapManager;
+
+impl OutcomeCapManager {
+    /// Returns the configured maximum number of outcomes per market.
+    ///
+    /// Falls back to [`DEFAULT_MAX_OUTCOMES_PER_MARKET`] when the admin has
+    /// never configured a cap, so existing behaviour is unchanged.
+    pub fn get_max_outcomes(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::MaxOutcomesPerMarket)
+            .unwrap_or(DEFAULT_MAX_OUTCOMES_PER_MARKET)
+    }
+
+    /// Stores a new cap on outcomes per market (admin only).
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `caller` - The admin address; must authorize the call
+    /// * `max_outcomes` - The new cap, between [`MIN_OUTCOMES_PER_MARKET`] and
+    ///   [`MAX_OUTCOMES_PER_MARKET_CEILING`] inclusive
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] - `caller` is not the stored primary admin
+    /// * [`Error::InvalidInput`] - `max_outcomes` is outside the allowed range
+    ///
+    /// # Effects
+    ///
+    /// The cap applies to markets created after the call. Markets that already
+    /// exist keep their outcomes: lowering the cap must never invalidate a live
+    /// market, otherwise its bets could never be resolved.
+    pub fn set_max_outcomes(env: &Env, caller: &Address, max_outcomes: u32) -> Result<(), Error> {
+        // Admin authorization is enforced by the `set_max_outcomes_per_market`
+        // entrypoint; requiring auth here as well keeps the manager safe if it
+        // is ever called from another path.
+        caller.require_auth();
+
+        if max_outcomes < MIN_OUTCOMES_PER_MARKET || max_outcomes > MAX_OUTCOMES_PER_MARKET_CEILING {
+            return Err(Error::InvalidInput);
+        }
+
+        let key = DataKey::MaxOutcomesPerMarket;
+        env.storage().persistent().set(&key, &max_outcomes);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MARKET_TTL_LEDGERS, MARKET_TTL_LEDGERS);
+
+        EventEmitter::emit_max_outcomes_per_market_set(env, caller, max_outcomes);
+
+        Ok(())
+    }
+
+    /// Rejects an outcome list that violates the configured cap.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidOutcomes`] - fewer than [`MIN_OUTCOMES_PER_MARKET`] outcomes
+    /// * [`Error::TooManyOutcomes`] - more than [`OutcomeCapManager::get_max_outcomes`] outcomes
+    pub fn validate_outcome_count(env: &Env, outcomes: &Vec<String>) -> Result<(), Error> {
+        let count = outcomes.len();
+
+        if count < MIN_OUTCOMES_PER_MARKET {
+            return Err(Error::InvalidOutcomes);
+        }
+        if count > Self::get_max_outcomes(env) {
+            return Err(Error::TooManyOutcomes);
+        }
+
+        Ok(())
+    }
+}
+
 pub struct MarketValidator;
 
 impl MarketValidator {
@@ -425,13 +540,16 @@ impl MarketValidator {
     /// # Errors
     ///
     /// * `Error::InvalidQuestion` - Question is empty or exceeds 500 characters
-    /// * `Error::InvalidOutcomes` - Less than 2 outcomes, more than 10 outcomes, or empty outcome strings
+    /// * `Error::InvalidOutcomes` - Less than 2 outcomes, or empty outcome strings
+    /// * `Error::TooManyOutcomes` - More outcomes than [`OutcomeCapManager::get_max_outcomes`]
+    ///   allows (default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `Error::InvalidDuration` - Duration is 0 or exceeds 365 days
     ///
     /// # Validation Rules
     ///
     /// * Question: Must be non-empty and between 1-500 characters
-    /// * Outcomes: Must have 2-10 unique, non-empty outcome strings
+    /// * Outcomes: Must have at least 2 unique, non-empty outcome strings, and no
+    ///   more than the admin-configured cap (default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * Duration: Must be between 1-365 days inclusive
     ///
     /// # Example
@@ -471,6 +589,10 @@ impl MarketValidator {
         duration_days: u32,
     ) -> Result<(), Error> {
         Self::validate_unique_outcomes(outcomes)?;
+        // Outcome-count enforcement is owned by `OutcomeCapManager` so the cap
+        // stays a single admin-configurable parameter instead of a constant
+        // duplicated across validators.
+        OutcomeCapManager::validate_outcome_count(env, outcomes)?;
         crate::validation::CreationValidator::validate_market_creation(
             env,
             question,
@@ -1078,6 +1200,84 @@ impl MarketStateManager {
             &new_description,
             &market.admin,
         );
+        Ok(())
+    }
+
+    /// Updates a market's question text before any stake has been committed.
+    ///
+    /// Market creators regularly publish a market with a typo. Because the
+    /// question is part of the market's public metadata commitment it must be
+    /// frozen as soon as real value is at risk: allowing edits after the first
+    /// stake would let a creator move the goalposts after observing bets.
+    ///
+    /// # Rules
+    ///
+    /// - `creator` must be the market creator (`market.admin`).
+    /// - The market must still be `Active` and its `end_time` must not have passed.
+    /// - `total_staked` must be exactly zero, and neither `votes` nor `stakes`
+    ///   may contain entries.
+    /// - The new question must be non-empty and at most [`MAX_QUESTION_LENGTH`]
+    ///   bytes long.
+    ///
+    /// # Effects
+    ///
+    /// - Rewrites `question` and refreshes `metadata_commitment`, so clients
+    ///   holding the previous commitment fail `verify_market_metadata` and
+    ///   re-read the market.
+    /// - Emits [`crate::events::MarketDescriptionUpdatedEvent`] carrying the old
+    ///   and new question text (the question is the market's description).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MarketNotFound`] — no market exists for `market_id`
+    /// - [`Error::Unauthorized`] — `creator` is not the market creator
+    /// - [`Error::InvalidQuestion`] — the new question is empty
+    /// - [`Error::QuestionTooLong`] — the new question exceeds [`MAX_QUESTION_LENGTH`]
+    /// - [`Error::InvalidState`] — market is not `Active`, or a stake/vote exists
+    /// - [`Error::MarketClosed`] — `end_time` has already passed
+    pub fn update_question(
+        env: &Env,
+        market_id: &Symbol,
+        creator: &Address,
+        new_question: String,
+    ) -> Result<(), Error> {
+        if new_question.is_empty() {
+            return Err(Error::InvalidQuestion);
+        }
+        if new_question.len() > MAX_QUESTION_LENGTH {
+            return Err(Error::QuestionTooLong);
+        }
+
+        let mut market = Self::get_market(env, market_id)?;
+
+        if market.admin != *creator {
+            return Err(Error::Unauthorized);
+        }
+        if market.state != MarketState::Active {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() >= market.end_time {
+            return Err(Error::MarketClosed);
+        }
+        // Stake gate: once anyone has committed funds the question is frozen,
+        // so no participant can have acted on text that later changes.
+        if market.total_staked != 0 || !market.votes.is_empty() || !market.stakes.is_empty() {
+            return Err(Error::InvalidState);
+        }
+
+        let old_question = market.question.clone();
+        market.question = new_question.clone();
+        market.refresh_metadata_commitment(env);
+        Self::update_market(env, market_id, &market);
+
+        EventEmitter::emit_market_description_updated(
+            env,
+            market_id,
+            &old_question,
+            &new_question,
+            creator,
+        );
+
         Ok(())
     }
 

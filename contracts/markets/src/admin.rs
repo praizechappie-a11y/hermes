@@ -1,11 +1,12 @@
 use crate::errors::ContractError;
-use soroban_sdk::{contracttype, Address, Env, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     AdminCooldownSeconds,
     AdminLastAction(Symbol),
+    AdminList,
 }
 
 /// Helper struct for managing admin cooldowns.
@@ -41,6 +42,21 @@ impl AdminManager {
             result
         } else {
             0
+        }
+    }
+
+    /// Returns `true` if `address` is already present in `DataKey::AdminList`.
+    ///
+    /// Used by `add_admin` to reject duplicate admin entries before appending.
+    pub fn is_admin_in_list(env: &Env, address: &Address) -> bool {
+        let key = DataKey::AdminList;
+        if let Some(admins) = env.storage().persistent().get::<_, Vec<Address>>(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, 535_680, 535_680);
+            admins.iter().any(|a| a == *address)
+        } else {
+            false
         }
     }
 

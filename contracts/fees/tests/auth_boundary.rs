@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use fees::{ContractError, FeeConfig, FeesContract, FeesContractClient};
-use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, xdr::ToXdr, Address, Env};
 use std::ops::Deref;
 
 #[contract]
@@ -87,6 +87,13 @@ fn default_fee_config() -> FeeConfig {
     }
 }
 
+/// Compute the sha256 hash of a FeeConfig's XDR encoding, matching what
+/// the contract verifies in `update_fee_config`.
+fn fee_config_hash(env: &Env, config: &FeeConfig) -> soroban_sdk::BytesN<32> {
+    let bytes = config.to_xdr(env);
+    env.crypto().sha256(&bytes)
+}
+
 // ============================================================
 // Auth Boundary Tests — initialize
 // ============================================================
@@ -144,6 +151,35 @@ fn test_initialize_cannot_reinitialize() {
 // ============================================================
 
 #[test]
+fn test_update_fee_config_rejects_hash_mismatch() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let client = register_and_initialize(&env, &admin);
+
+    let config = default_fee_config();
+
+    // Commit a hash for a *different* (wrong) config
+    let wrong_config = FeeConfig {
+        platform_fee_percentage: 100,
+        creation_fee: 0,
+        min_fee_amount: 1,
+        max_fee_amount: 1_000_000,
+        collection_threshold: 50_000,
+        fees_enabled: true,
+    };
+    let wrong_hash = fee_config_hash(&env, &wrong_config);
+    client.commit_fee_config(&admin, &wrong_hash);
+
+    // Reveal with a different config — must be rejected
+    let result = client.try_update_fee_config(&admin, &config);
+    assert!(
+        matches!(result, Err(Ok(ContractError::CommitHashMismatch))),
+        "update_fee_config must reject configs that don't match the committed hash, got: {:?}",
+        result
+    );
+}
+
+#[test]
 fn test_update_fee_config_rejects_non_admin() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -165,6 +201,9 @@ fn test_update_fee_config_succeeds_with_admin_auth() {
     let client = register_and_initialize(&env, &admin);
 
     let config = default_fee_config();
+    let hash = fee_config_hash(&env, &config);
+    client.commit_fee_config(&admin, &hash);
+    let _ = env.auths();
     client.update_fee_config(&admin, &config);
 
     let auths = env.auths();
@@ -218,7 +257,39 @@ fn test_update_fee_config_rejects_zero_minimum_when_fees_enabled() {
     assert!(matches!(result, Err(Ok(ContractError::InvalidInput))));
 
     config.fees_enabled = false;
+    let hash = fee_config_hash(&env, &config);
+    client.commit_fee_config(&admin, &hash);
     client.update_fee_config(&admin, &config);
+}
+
+#[test]
+fn test_update_fee_config_requires_commit_and_apply_timelock() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let client = register_and_initialize(&env, &admin);
+    let config = default_fee_config();
+
+    let no_commit = client.try_update_fee_config(&admin, &config);
+    assert!(matches!(
+        no_commit,
+        Err(Ok(ContractError::NoPendingFeeCommit))
+    ));
+
+    let hash = fee_config_hash(&env, &config);
+    client.commit_fee_config(&admin, &hash);
+    client.update_fee_config(&admin, &config);
+
+    let early_apply = client.try_apply_fee_update(&admin);
+    assert!(matches!(
+        early_apply,
+        Err(Ok(ContractError::FeeRevealTooEarly))
+    ));
+
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp += 86_401;
+    });
+    client.apply_fee_update(&admin);
+    assert_eq!(client.get_fee_config(), config);
 }
 
 // ============================================================
@@ -346,15 +417,15 @@ fn test_collect_fees_fails_below_threshold() {
         other => panic!("Collection below threshold should fail, got: {:?}", other),
     }
 
-    // Schedule status must be updated to Failed
+    // A threshold rejection does not change the withdrawal schedule.
     assert_eq!(
         client.get_withdrawal_schedule().status,
-        fees::FeeWithdrawalStatus::Failed
+        fees::FeeWithdrawalStatus::Ready
     );
 }
 
 #[test]
-fn test_fee_withdrawal_status_failed_and_recovery() {
+fn test_fee_withdrawal_status_unchanged_and_recovery() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let client = register_and_initialize(&env, &admin);
@@ -369,8 +440,8 @@ fn test_fee_withdrawal_status_failed_and_recovery() {
         fail_result,
         Err(Ok(ContractError::BelowCollectionThreshold))
     );
-    let failed_schedule = client.get_withdrawal_schedule();
-    assert_eq!(failed_schedule.status, fees::FeeWithdrawalStatus::Failed);
+    let unchanged_schedule = client.get_withdrawal_schedule();
+    assert_eq!(unchanged_schedule.status, fees::FeeWithdrawalStatus::Ready);
 
     // 3. Deposit sufficient fees exceeding threshold (150M stroops > 100M threshold)
     let _ = invoke_as_authorized_caller(&env, &client, 150_000_000, |market, fees, caller, amount| {
@@ -756,6 +827,8 @@ fn test_all_state_changing_entrypoints_succeed_with_proper_auth() {
 
     let config = default_fee_config();
 
+    let hash = fee_config_hash(&env, &config);
+    client.commit_fee_config(&admin, &hash);
     assert!(
         client.try_update_fee_config(&admin, &config).is_ok(),
         "Admin should invoke update_fee_config"
@@ -834,6 +907,20 @@ fn test_pending_fee_commit_inspection() {
 }
 
 #[test]
+fn test_update_fee_config_rejects_reveal_before_timelock() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let client = register_and_initialize(&env, &admin);
+    let hash = soroban_sdk::BytesN::from_array(&env, &[0x55u8; 32]);
+    client.commit_fee_config(&admin, &hash);
+
+    match client.try_update_fee_config(&admin, &default_fee_config()) {
+        Err(Ok(ContractError::FeeRevealTooEarly)) => {}
+        other => panic!("Expected FeeRevealTooEarly, got: {:?}", other),
+    }
+}
+
+#[test]
 fn test_pending_fee_config_inspection_and_apply() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -846,6 +933,8 @@ fn test_pending_fee_config_inspection_and_apply() {
     let new_cfg = default_fee_config();
     let original_cfg = client.get_fee_config();
     assert_ne!(new_cfg, original_cfg);
+    let hash = fee_config_hash(&env, &new_cfg);
+    client.commit_fee_config(&admin, &hash);
     client.update_fee_config(&admin, &new_cfg);
     assert_eq!(client.get_fee_config(), original_cfg);
 
@@ -859,8 +948,8 @@ fn test_pending_fee_config_inspection_and_apply() {
     // Apply before timelock fails
     let early_res = client.try_apply_fee_update(&admin);
     match early_res {
-        Err(Ok(ContractError::FeeRevealTooEarly)) => {}
-        other => panic!("Expected FeeRevealTooEarly, got: {:?}", other),
+        Err(Ok(ContractError::FeeApplyTooEarly)) => {}
+        other => panic!("Expected FeeApplyTooEarly, got: {:?}", other),
     }
 
     // Fast-forward past timelock

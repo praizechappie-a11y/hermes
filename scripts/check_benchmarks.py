@@ -98,6 +98,65 @@ def load_thresholds(thresholds_path: str) -> dict:
         return json.load(f)
 
 
+def discover_entrypoints(contract: str) -> list:
+    """Discover state-changing public entrypoints for a contract.
+
+    Parses the contract's Rust sources for `pub fn` definitions inside
+    `#[contractimpl]` blocks and returns their names. Falls back to an empty
+    list if the contract sources cannot be located.
+    """
+    contract_dir = Path("contracts") / contract
+    src_dir = contract_dir / "src"
+    if not src_dir.exists():
+        print(
+            f"Warning: Could not locate sources for contract '{contract}' at '{src_dir}'. "
+            "Skipping entrypoint coverage check.",
+            file=sys.stderr,
+        )
+        return []
+
+    entrypoints = []
+    for rs_file in sorted(src_dir.rglob("*.rs")):
+        try:
+            content = rs_file.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: Failed reading {rs_file}: {e}", file=sys.stderr)
+            continue
+
+        in_impl = False
+        depth = 0
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not in_impl:
+                if stripped.startswith("#[contractimpl]"):
+                    in_impl = True
+                    depth = 0
+                continue
+
+            depth += line.count("{") - line.count("}")
+            if depth <= 0 and "{" in line and "}" in line:
+                # Single-line impl block or closing brace on same line.
+                pass
+
+            if stripped.startswith("pub fn "):
+                name = stripped[len("pub fn "):].split("(")[0].strip()
+                if name and name not in entrypoints:
+                    entrypoints.append(name)
+
+            if depth <= 0 and "}" in line:
+                in_impl = False
+
+    return entrypoints
+
+
+def check_entrypoint_coverage(contract: str, config: dict) -> list:
+    """Return entrypoints that are missing from the thresholds configuration."""
+    thresholds = config.get("thresholds", {})
+    entrypoints = discover_entrypoints(contract)
+    missing = [ep for ep in entrypoints if ep not in thresholds]
+    return missing
+
+
 def find_benchmark_results(criterion_dir: Path) -> dict:
     """Traverse criterion output directory to collect benchmark metrics."""
     results = {}
@@ -262,6 +321,21 @@ def main():
 
     config = load_thresholds(args.thresholds)
     evaluations, has_regressions = evaluate_benchmarks(benchmarks, config)
+
+    missing_entrypoints = check_entrypoint_coverage(args.contract, config)
+    if missing_entrypoints:
+        print(
+            "\n❌ The following state-changing entrypoints are missing from "
+            f"'{args.thresholds}':",
+            file=sys.stderr,
+        )
+        for ep in missing_entrypoints:
+            print(f"  - {ep}", file=sys.stderr)
+        print(
+            "Add threshold entries for these entrypoints so regressions are caught.",
+            file=sys.stderr,
+        )
+        has_regressions = True
 
     generate_reports(evaluations, has_regressions, args.report_md, args.report_json, args.contract)
 

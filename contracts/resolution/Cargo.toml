@@ -14,6 +14,7 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 markets = { path = "../markets" }
+serde_json = { workspace = true }
 
 [[test]]
 name = "error_tests"
@@ -22,3 +23,7 @@ path = "tests/error_tests.rs"
 [[test]]
 name = "resolution_flow"
 path = "tests/resolution_flow.rs"
+
+[[test]]
+name = "gas_snap"
+path = "tests/gas_snap.rs"

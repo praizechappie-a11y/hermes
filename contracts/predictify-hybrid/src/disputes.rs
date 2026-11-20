@@ -1,5 +1,5 @@
 use crate::errors::Error;
-use crate::storage::{AdminStorage, MarketStateManager, TokenStorage};
+use crate::storage::{AdminStorage, DataKey, MarketStateManager, TokenStorage};
 use crate::types::{
     Dispute, DisputeEscalation, DisputeFeeDistribution, DisputeResolution, DisputeStats,
     DisputeStatus, DisputeTimeout, DisputeTimeoutOutcome, DisputeTimeoutStatus, Market,
@@ -1308,15 +1308,23 @@ impl DisputeManager {
     /// - **Quality Metrics**: Assess market and oracle performance
     pub fn get_market_disputes(env: &Env, market_id: Symbol) -> Result<Vec<Dispute>, Error> {
         let market = MarketStateManager::get_market(env, &market_id)?;
-        let mut history = env.storage().persistent()
-            .get::<_, Vec<Dispute>>(&DataKey::DisputeHistory(market_id.clone()))
-            .unwrap_or_else(|| Vec::new(env));
+        let history_key = DataKey::DisputeHistory(market_id.clone());
+        let stored_history = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Dispute>>(&history_key);
+        if stored_history.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&history_key, 535680, 535680);
+        }
+        let mut history = stored_history.unwrap_or_else(|| Vec::new(env));
 
         if history.is_empty() {
             let extracted = DisputeUtils::extract_disputes_from_market(env, &market, market_id.clone());
             if extracted.len() > 0 {
-                env.storage().persistent().set(&DataKey::DisputeHistory(market_id.clone()), &extracted);
-                env.storage().persistent().extend_ttl(&DataKey::DisputeHistory(market_id.clone()), 535680, 535680);
+                env.storage().persistent().set(&history_key, &extracted);
+                env.storage().persistent().extend_ttl(&history_key, 535680, 535680);
                 return Ok(extracted);
             }
         }
@@ -3672,7 +3680,7 @@ pub struct CommunityConsensus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     fn create_test_market(env: &Env, end_time: u64) -> Market {
         let mut outcomes = Vec::new(env);
@@ -4509,6 +4517,98 @@ mod tests {
             assert!(DisputeManager::get_history_cap(&env).is_none());
             DisputeManager::set_history_cap(&env, admin.clone(), 5).unwrap();
             assert_eq!(DisputeManager::get_history_cap(&env), Some(5));
+        });
+    }
+
+    #[test]
+    fn test_get_market_disputes_with_no_history() {
+        let env = Env::default();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let market_id = Symbol::new(&env, "market_no_disputes");
+        let market = create_test_market(&env, env.ledger().timestamp() + 86400);
+
+        env.as_contract(&contract_id, || {
+            MarketStateManager::update_market(&env, &market_id, &market);
+            let disputes = DisputeManager::get_market_disputes(&env, market_id.clone()).unwrap();
+            assert!(disputes.is_empty());
+
+            let missing_market = Symbol::new(&env, "missing_market");
+            assert!(matches!(
+                DisputeManager::get_market_disputes(&env, missing_market),
+                Err(Error::MarketNotFound)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_get_market_disputes_returns_replacement_for_same_market_key() {
+        let env = Env::default();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let market_id = Symbol::new(&env, "market_replaced");
+        let market = create_test_market(&env, env.ledger().timestamp() + 86400);
+        let original = testing::create_test_dispute(
+            &env,
+            Address::generate(&env),
+            market_id.clone(),
+            MIN_DISPUTE_STAKE,
+        );
+        let replacement_user = Address::generate(&env);
+        let replacement = testing::create_test_dispute(
+            &env,
+            replacement_user.clone(),
+            market_id.clone(),
+            MIN_DISPUTE_STAKE * 2,
+        );
+
+        env.as_contract(&contract_id, || {
+            MarketStateManager::update_market(&env, &market_id, &market);
+            let history_key = DataKey::DisputeHistory(market_id.clone());
+            let mut original_history = Vec::new(&env);
+            original_history.push_back(original);
+            env.storage().persistent().set(&history_key, &original_history);
+
+            let mut replacement_history = Vec::new(&env);
+            replacement_history.push_back(replacement);
+            env.storage()
+                .persistent()
+                .set(&history_key, &replacement_history);
+
+            let disputes = DisputeManager::get_market_disputes(&env, market_id).unwrap();
+            let stored = disputes.get(0).unwrap();
+            assert_eq!(stored.user, replacement_user);
+            assert_eq!(stored.stake, MIN_DISPUTE_STAKE * 2);
+        });
+    }
+
+    #[test]
+    fn test_get_market_disputes_extends_history_ttl_on_read() {
+        let env = Env::default();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let market_id = Symbol::new(&env, "market_history_ttl");
+        let market = create_test_market(&env, env.ledger().timestamp() + 86400);
+        let dispute = testing::create_test_dispute(
+            &env,
+            Address::generate(&env),
+            market_id.clone(),
+            MIN_DISPUTE_STAKE,
+        );
+
+        env.as_contract(&contract_id, || {
+            MarketStateManager::update_market(&env, &market_id, &market);
+            let key = DataKey::DisputeHistory(market_id.clone());
+            let mut history = Vec::new(&env);
+            history.push_back(dispute);
+            env.storage().persistent().set(&key, &history);
+
+            env.ledger().with_mut(|ledger| ledger.sequence_number += 10);
+            let ttl_before_read = env.storage().persistent().get_ttl(&key);
+            DisputeManager::get_market_disputes(&env, market_id).unwrap();
+            let ttl_after_read = env.storage().persistent().get_ttl(&key);
+
+            assert!(
+                ttl_after_read > ttl_before_read,
+                "reading stored dispute history should extend its TTL"
+            );
         });
     }
 

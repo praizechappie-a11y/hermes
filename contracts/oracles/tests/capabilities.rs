@@ -17,7 +17,17 @@
 #![cfg(test)]
 
 use oracles::{CapabilityFlag, OraclesContract, OraclesContractClient};
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
+
+#[contract]
+pub struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -169,8 +179,8 @@ fn capabilities_unaffected_by_registry_state() {
 
     // Mutate registry state.
     let admin  = Address::generate(&f.env);
-    let oracle = Address::generate(&f.env);
-    f.client.add_oracle(&admin, &oracle);
+    let oracle = f.env.register(MockOracle, ());
+    f.client.add_oracle(&admin, &oracle).unwrap();
 
     let caps_after_add = f.client.capabilities();
     assert_eq!(

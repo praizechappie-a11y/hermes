@@ -19,7 +19,7 @@
 //! |----:|-----------------------|------------------------------------------------------|
 //! |   0 | `GET_PRICE`           | `get_price(oracle, feed)` entrypoint present         |
 //! |   1 | `GET_PRICE_DATA`      | `get_price_data(oracle, feed)` entrypoint present    |
-//! |   2 | `IS_ORACLE_HEALTHY`   | `is_oracle_healthy(oracle)` entrypoint present       |
+//! |   2 | `IS_ORACLE_HEALTHY`   | `is_oracle_healthy(oracle, feed_id)` checks liveness and freshness |
 //! |   3 | `ORACLE_REGISTRY`     | `add_oracle` / `remove_oracle` / `list_oracles` present |
 //! |   4 | `CONFIDENCE_INTERVAL` | `OraclePriceData.confidence` field is populated      |
 //! |   5 | `PRICE_EXPONENT`      | `OraclePriceData.exponent` field is populated        |
@@ -72,10 +72,11 @@ impl CapabilityFlag {
     /// containing price, publish time, confidence interval, and exponent.
     pub const GET_PRICE_DATA: u64 = 1 << 1;
 
-    /// Bit 2 — `is_oracle_healthy(oracle)` entrypoint is present.
+    /// Bit 2 — `is_oracle_healthy(oracle, feed_id)` checks liveness and freshness.
     ///
     /// When set, callers may query whether a registered oracle reports
-    /// itself as live.
+    /// itself as live and provides price data within the configured staleness
+    /// threshold.
     pub const IS_ORACLE_HEALTHY: u64 = 1 << 2;
 
     /// Bit 3 — Oracle registry management is present.

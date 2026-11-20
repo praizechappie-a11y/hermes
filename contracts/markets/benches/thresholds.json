@@ -26,6 +26,30 @@
       "unit": "ns",
       "description": "Microbenchmark proxy for claim_winnings payout calculation"
     },
+    "set_market_payout_curve": {
+      "max_time_ns": 2000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Microbenchmark proxy for set_market_payout_curve curve validation + storage write"
+    },
+    "propose_pause": {
+      "max_time_ns": 2000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Microbenchmark proxy for propose_pause proposal storage"
+    },
+    "approve_pause": {
+      "max_time_ns": 2000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Microbenchmark proxy for approve_pause approval tally update"
+    },
+    "execute_pause": {
+      "max_time_ns": 2000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Microbenchmark proxy for execute_pause pause state transition"
+    },
     "contract_create_market": {
       "max_time_ns": 5000000,
       "max_regression_pct": 5.0,
@@ -43,6 +67,30 @@
       "max_regression_pct": 5.0,
       "unit": "ns",
       "description": "Soroban contract resolve_market full invocation (creator auth)"
+    },
+    "contract_set_market_payout_curve": {
+      "max_time_ns": 5000000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Soroban contract set_market_payout_curve full invocation (admin auth)"
+    },
+    "contract_propose_pause": {
+      "max_time_ns": 5000000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Soroban contract propose_pause full invocation (admin auth)"
+    },
+    "contract_approve_pause": {
+      "max_time_ns": 5000000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Soroban contract approve_pause full invocation (admin auth)"
+    },
+    "contract_execute_pause": {
+      "max_time_ns": 5000000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Soroban contract execute_pause full invocation (admin auth)"
     }
   }
 }

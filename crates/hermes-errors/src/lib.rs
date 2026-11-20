@@ -91,6 +91,10 @@ impl ErrorDefinition {
 /// |               |            | 210–299    | domain-specific     |
 /// | markets       | 300–399    | 301–309    | auth                |
 /// |               |            | 310–399    | domain-specific     |
+/// | monitor       | 400–499    | 401–409    | auth / initialization |
+/// |               |            | 410–419    | cap enforcement     |
+/// |               |            | 420–429    | arithmetic guards   |
+/// |               |            | 430–499    | reserved            |
 /// | (etc.)        | (etc.)     | (etc.)     | (etc.)              |
 ///
 /// # Deployment Record
@@ -236,6 +240,37 @@ pub fn all_errors() -> Vec<ErrorDefinition> {
             "The requested operation is not permitted in the current contract state.",
         )
         .with_range(130, 139),
+
+        // =====================================================================
+        // MONITOR CONTRACT ERRORS (codes 400–499)
+        // =====================================================================
+        // Scope: monitor
+        // Ranges: 401–409 (auth / initialization), 410–419 (cap enforcement),
+        //         420–429 (arithmetic guards), 430–499 (reserved)
+
+        // ----- Auth / initialization (401–409) -----
+        ErrorDefinition::new(401, "Unauthorized", "Caller is not the registered admin.")
+            .with_range(401, 409),
+        ErrorDefinition::new(402, "NotInitialized", "Contract has not been initialized; call `initialize` first.")
+            .with_range(401, 409),
+        ErrorDefinition::new(403, "AlreadyInitialized", "Contract has already been initialized.")
+            .with_range(401, 409),
+        ErrorDefinition::new(404, "InvalidInput", "One or more input parameters are invalid (e.g. a zero or out-of-range cap value).")
+            .with_range(401, 409),
+
+        // ----- Cap enforcement (410–419) -----
+        ErrorDefinition::new(410, "BetCapExceeded", "Recording a bet would exceed this account's per-account bet cap.")
+            .with_range(410, 419),
+        ErrorDefinition::new(411, "PositionCapExceeded", "Recording a position would exceed this account's per-account position cap.")
+            .with_range(410, 419),
+        ErrorDefinition::new(412, "SubscriptionCapExceeded", "Recording a subscription would exceed this account's per-account subscription cap.")
+            .with_range(410, 419),
+
+        // ----- Arithmetic guards (420–429) -----
+        ErrorDefinition::new(420, "Overflow", "An arithmetic overflow was detected on an internal counter.")
+            .with_range(420, 429),
+        ErrorDefinition::new(421, "Underflow", "An arithmetic underflow was detected; a counter decrement was attempted on a zero-valued count.")
+            .with_range(420, 429),
     ]
 }
 
@@ -324,5 +359,18 @@ mod tests {
             find_by_code(110).is_some(),
             "MarketNotFound (110) must be defined"
         );
+    }
+
+    #[test]
+    fn monitor_errors_are_defined() {
+        assert!(find_by_code(401).is_some(), "monitor Unauthorized (401) must be defined");
+        assert!(find_by_code(402).is_some(), "monitor NotInitialized (402) must be defined");
+        assert!(find_by_code(403).is_some(), "monitor AlreadyInitialized (403) must be defined");
+        assert!(find_by_code(404).is_some(), "monitor InvalidInput (404) must be defined");
+        assert!(find_by_code(410).is_some(), "monitor BetCapExceeded (410) must be defined");
+        assert!(find_by_code(411).is_some(), "monitor PositionCapExceeded (411) must be defined");
+        assert!(find_by_code(412).is_some(), "monitor SubscriptionCapExceeded (412) must be defined");
+        assert!(find_by_code(420).is_some(), "monitor Overflow (420) must be defined");
+        assert!(find_by_code(421).is_some(), "monitor Underflow (421) must be defined");
     }
 }

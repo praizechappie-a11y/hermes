@@ -26,6 +26,14 @@ impl DummyContract {
     pub fn check_cd(env: Env, admin: Address, func: Symbol) -> Result<(), ContractError> {
         AdminManager::check_admin_cooldown(&env, &admin, &func)
     }
+
+    pub fn add_admin(env: Env, admin: Address) -> Result<(), ContractError> {
+        AdminManager::add_admin(&env, &admin)
+    }
+
+    pub fn get_admins(env: Env) -> soroban_sdk::Vec<Address> {
+        AdminManager::get_admins(&env)
+    }
 }
 
 #[test]
@@ -89,4 +97,33 @@ fn test_cooldown_disabled() {
     // Should succeed consecutively
     assert!(client.try_check_cd(&admin, &func_name).is_ok());
     assert!(client.try_check_cd(&admin, &func_name).is_ok());
+}
+
+#[test]
+fn test_add_admin_rejects_duplicate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DummyContract, ());
+    let client = DummyContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+
+    // First add succeeds
+    assert!(client.try_add_admin(&admin).is_ok());
+    let len_after_first = client.get_admins().len();
+    assert_eq!(len_after_first, 1);
+
+    // Second add with the same address must fail
+    let res = client.try_add_admin(&admin);
+    let err = res.unwrap_err().unwrap();
+    assert!(
+        err == ContractError::AdminAddressInvalid
+            || err == ContractError::AdminAlreadyExists,
+        "expected duplicate admin rejection, got {:?}",
+        err
+    );
+
+    // Admin list length must be unchanged
+    assert_eq!(client.get_admins().len(), len_after_first);
 }

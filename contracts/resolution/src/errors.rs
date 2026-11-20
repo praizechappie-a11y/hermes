@@ -34,6 +34,8 @@ pub enum ContractError {
     OracleResultNotAvailable = 10,
     /// Invalid winning outcomes; thrown when the winning outcomes list is empty or invalid.
     InvalidWinningOutcomes = 11,
+    /// Oracle not registered; thrown when the supplied oracle address is not in the oracle registry.
+    OracleNotRegistered = 12,
 }
 
 #[cfg(test)]
@@ -54,5 +56,6 @@ mod tests {
         assert_eq!(ContractError::ResolutionCooldownActive as u32, 9);
         assert_eq!(ContractError::OracleResultNotAvailable as u32, 10);
         assert_eq!(ContractError::InvalidWinningOutcomes as u32, 11);
+        assert_eq!(ContractError::OracleNotRegistered as u32, 12);
     }
 }

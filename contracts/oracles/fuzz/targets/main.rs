@@ -5,7 +5,7 @@ use soroban_sdk::{
     contract, contractimpl, Address, Env, String as SorobanString, Vec as SorobanVec,
     testutils::{Address as _, Ledger as _},
 };
-use oracles::{Error, OraclesContract, OraclesContractClient, OraclePriceData};
+use oracles::{CapabilityFlag, OraclesContract, OraclesContractClient, OraclePriceData};
 
 /// A mock oracle contract whose behavior is dynamically configurable via instances storage.
 #[contract]
@@ -13,6 +13,10 @@ pub struct FuzzMockOracle;
 
 #[contractimpl]
 impl FuzzMockOracle {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+
     /// Retrieve the current price, panicking if configured to fail.
     pub fn get_price(env: Env, _feed_id: SorobanString) -> i128 {
         if env.storage().instance().get(&soroban_sdk::symbol_short!("panic")).unwrap_or(false) {
@@ -210,7 +214,8 @@ fuzz_target!(|data: &[u8]| {
                     Address::generate(&env)
                 };
 
-                let _ = client.is_oracle_healthy(&oracle_addr);
+                let health_feed = SorobanString::from_str(&env, "BTC/USD");
+                let _ = client.is_oracle_healthy(&oracle_addr, &health_feed);
             }
             _ => unreachable!(),
         }

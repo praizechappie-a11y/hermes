@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Map, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol};
 
 mod errors;
 pub use errors::ContractError;
@@ -82,6 +82,22 @@ pub struct FeeCollectionResult {
     pub remaining_balance: i128,
 }
 
+/// A pending fee configuration commit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeCommitment {
+    pub commitment: BytesN<32>,
+    pub admin: Address,
+}
+
+/// A revealed fee configuration waiting for its timelock to expire.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedFeeUpdate {
+    pub config: FeeConfig,
+    pub apply_eta: u64,
+}
+
 // ============================================================
 // Storage keys
 // ============================================================
@@ -92,42 +108,15 @@ const COLLECTED_FEES_KEY: &str = "CollectedFees";
 const FEES_PAUSED_KEY: &str = "FeesPaused";
 const WITHDRAWAL_SCHEDULE_KEY: &str = "WithdrawalSchedule";
 const FEE_COMMIT_KEY: &str = "FeeCommit";
-const FEE_QUEUED_KEY: &str = "FeeQueued";
-
-#[contracttype]
-#[derive(Clone)]
-enum DataKey {
-    AuthorizedCallers,
-}
-
-/// Default timelock cooldown in seconds for fee updates (24 hours).
-const DEFAULT_TIMELOCK_SECONDS: u64 = 86_400;
-/// Minimum timelock cooldown in seconds for fee updates (1 hour).
-const MIN_TIMELOCK_SECONDS: u64 = 3_600;
+const FEE_QUEUED_UPDATE_KEY: &str = "FeeQueued";
+const FEE_UPDATE_TIMELOCK_SECONDS: u64 = 86_400;
 
 /// Maximum platform fee percentage in basis points (100% = 10_000).
 const MAX_FEE_PERCENTAGE: i128 = 10_000;
 
-/// Hard protocol upper bound on `max_fee_amount` in stroops.
-///
-/// Set to 10_000_000_000 (10,000 XLM).  No admin can set a
-/// `max_fee_amount` higher than this value, even after contract
-/// upgrade, because the check lives inside `validate_fee_config` which
-/// is called on every config-mutating entrypoint.
-///
-/// # Rationale
-///
-/// Without this cap a compromised or malicious admin could set fees so
-/// high that any withdrawal leaves users with near-zero balances.
-/// 10,000 XLM is a generous operational ceiling that prevents such an
-/// attack while still accommodating any legitimate high-value use case.
-///
-/// # Protocol invariant
-///
-/// This constant MUST NOT be increased in future versions without a
-/// governance vote and an explicit security review.  Decreasing it is
-/// always safe.
-pub const MAX_FEE_AMOUNT: i128 = 10_000_000_000; // 10 000 XLM in stroops
+fn check_fee_timelock(env: &Env, committed_at: u64, window_seconds: u64) -> bool {
+    env.ledger().timestamp() < committed_at.saturating_add(window_seconds)
+}
 
 // ============================================================
 // Contract
@@ -179,6 +168,103 @@ pub struct FeesContract;
 /// | `is_authorized_caller`     | Check fee-recording authorization        |
 #[contractimpl]
 impl FeesContract {
+    /// Commits a hash for a future fee configuration reveal.
+    pub fn commit_fee_config(env: Env, admin: Address, commitment: BytesN<32>) -> Result<(), ContractError> {
+        admin.require_auth();
+        Self::assert_is_admin(&env, &admin)?;
+
+        env.storage().persistent().set(
+            &Symbol::new(&env, FEE_COMMIT_KEY),
+            &FeeCommitment {
+                commitment,
+                admin: admin.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Reveals a fee configuration and queues it after verifying its committed hash.
+    pub fn reveal_fee_config(
+        env: Env,
+        admin: Address,
+        new_config: FeeConfig,
+    ) -> Result<FeeConfig, ContractError> {
+        admin.require_auth();
+        Self::assert_is_admin(&env, &admin)?;
+        Self::validate_fee_config(&new_config)?;
+
+        let pending: FeeCommitment = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, FEE_COMMIT_KEY))
+            .ok_or(ContractError::NoPendingFeeCommit)?;
+
+        if pending.admin != admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let revealed_hash = Self::hash_fee_config(&env, &new_config);
+        if revealed_hash != pending.commitment {
+            return Err(ContractError::FeePreimageMismatch);
+        }
+
+        let apply_eta = env
+            .ledger()
+            .timestamp()
+            .checked_add(FEE_UPDATE_TIMELOCK_SECONDS)
+            .ok_or(ContractError::Overflow)?;
+        env.storage().persistent().set(
+            &Symbol::new(&env, FEE_QUEUED_UPDATE_KEY),
+            &QueuedFeeUpdate {
+                config: new_config.clone(),
+                apply_eta,
+            },
+        );
+        env.storage()
+            .persistent()
+            .remove(&Symbol::new(&env, FEE_COMMIT_KEY));
+
+        Ok(new_config)
+    }
+
+    /// Applies a revealed fee configuration after the timelock expires.
+    pub fn apply_fee_update(env: Env, admin: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        Self::assert_is_admin(&env, &admin)?;
+
+        let queued: QueuedFeeUpdate = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, FEE_QUEUED_UPDATE_KEY))
+            .ok_or(ContractError::NoQueuedFeeUpdate)?;
+
+        if env.ledger().timestamp() < queued.apply_eta {
+            return Err(ContractError::FeeRevealTooEarly);
+        }
+
+        Self::validate_fee_config(&queued.config)?;
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, FEE_CONFIG_KEY), &queued.config);
+        env.storage()
+            .persistent()
+            .remove(&Symbol::new(&env, FEE_QUEUED_UPDATE_KEY));
+        Ok(())
+    }
+
+    /// Cancels a queued fee configuration update.
+    pub fn cancel_fee_update(env: Env, admin: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        Self::assert_is_admin(&env, &admin)?;
+
+        let key = Symbol::new(&env, FEE_QUEUED_UPDATE_KEY);
+        if !env.storage().persistent().has(&key) {
+            return Err(ContractError::NoQueuedFeeUpdate);
+        }
+        env.storage().persistent().remove(&key);
+        Ok(())
+    }
+
     // ========================================================
     // State-changing entrypoints
     // ========================================================
@@ -293,6 +379,7 @@ impl FeesContract {
     /// - `ContractError::Unauthorized` if caller is not the admin.
     /// - `ContractError::FeePercentageTooHigh` if platform_fee_percentage > 10_000.
     /// - `ContractError::InvalidInput` if any fee value is negative.
+    /// - `ContractError::NoPendingFeeCommit` if no commitment exists.
     pub fn update_fee_config(
         env: Env,
         admin: Address,
@@ -307,6 +394,34 @@ impl FeesContract {
 
         // Ensure fees are not paused for config updates (consistency)
         Self::assert_fees_not_paused(&env)?;
+
+        if let Some(commit) = Self::get_pending_fee_commit_internal(&env) {
+            if check_fee_timelock(&env, commit.committed_at, DEFAULT_TIMELOCK_SECONDS) {
+                return Err(ContractError::FeeRevealTooEarly);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let eta = now.saturating_add(DEFAULT_TIMELOCK_SECONDS);
+
+        let queued = PendingFeeConfig {
+            config: new_config.clone(),
+            admin: admin.clone(),
+            proposed_at: now,
+            apply_eta: eta,
+        };
+
+        // Queue pending configuration for governance inspection
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, FEE_QUEUED_KEY), &queued);
+
+        // Verify the revealed config matches the committed hash.
+        let config_bytes = new_config.to_xdr(&env);
+        let config_hash = env.crypto().sha256(&config_bytes);
+        if config_hash != commit.hash {
+            return Err(ContractError::CommitHashMismatch);
+        }
 
         Self::queue_fee_config(&env, &admin, new_config, DEFAULT_TIMELOCK_SECONDS)
     }
@@ -323,9 +438,8 @@ impl FeesContract {
         let pending = Self::get_pending_fee_config_internal(&env)
             .ok_or(ContractError::NoPendingFeeCommit)?;
 
-        let now = env.ledger().timestamp();
-        if now < pending.apply_eta {
-            return Err(ContractError::FeeRevealTooEarly);
+        if check_fee_timelock(&env, pending.proposed_at, DEFAULT_TIMELOCK_SECONDS) {
+            return Err(ContractError::FeeApplyTooEarly);
         }
 
         env.storage()
@@ -481,6 +595,13 @@ impl FeesContract {
 
         Self::assert_fees_not_paused(&env)?;
 
+        // Enforce withdrawal cooldown: reject if called before next_withdrawal.
+        let now = env.ledger().timestamp();
+        let schedule_check = Self::get_withdrawal_schedule_internal(&env);
+        if schedule_check.last_withdrawal > 0 && now < schedule_check.next_withdrawal {
+            return Err(ContractError::WithdrawalCooldownActive);
+        }
+
         let collected: i128 = env
             .storage()
             .persistent()
@@ -490,11 +611,6 @@ impl FeesContract {
         let config = Self::get_fee_config_internal(&env)?;
 
         if collected < config.collection_threshold {
-            let mut schedule = Self::get_withdrawal_schedule_internal(&env);
-            schedule.status = FeeWithdrawalStatus::Failed;
-            env.storage()
-                .persistent()
-                .set(&Symbol::new(&env, WITHDRAWAL_SCHEDULE_KEY), &schedule);
             return Err(ContractError::BelowCollectionThreshold);
         }
 
@@ -504,7 +620,6 @@ impl FeesContract {
             .set(&Symbol::new(&env, COLLECTED_FEES_KEY), &0i128);
 
         // Update withdrawal schedule
-        let now = env.ledger().timestamp();
         let mut schedule = Self::get_withdrawal_schedule_internal(&env);
         schedule.last_withdrawal = now;
         schedule.next_withdrawal = now
@@ -827,34 +942,35 @@ impl FeesContract {
         }
         Ok(())
     }
+
+    fn hash_fee_config(env: &Env, config: &FeeConfig) -> BytesN<32> {
+        let mut encoded = Bytes::new(env);
+        encoded.append(&Bytes::from_slice(env, &config.platform_fee_percentage.to_be_bytes()));
+        encoded.append(&Bytes::from_slice(env, &config.creation_fee.to_be_bytes()));
+        encoded.append(&Bytes::from_slice(env, &config.min_fee_amount.to_be_bytes()));
+        encoded.append(&Bytes::from_slice(env, &config.max_fee_amount.to_be_bytes()));
+        encoded.append(&Bytes::from_slice(env, &config.collection_threshold.to_be_bytes()));
+        encoded.append(&Bytes::from_slice(
+            env,
+            &[if config.fees_enabled { 1u8 } else { 0u8 }],
+        ));
+        env.crypto().sha256(&encoded).into()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use super::check_fee_timelock;
+    use soroban_sdk::Env;
 
     #[test]
-    fn queue_fee_config_rejects_delay_below_minimum() {
+    fn fee_timelock_is_checked_against_the_current_timestamp() {
         let env = Env::default();
-        let admin = Address::generate(&env);
-        let config = FeeConfig {
-            platform_fee_percentage: 200,
-            creation_fee: 0,
-            min_fee_amount: 1,
-            max_fee_amount: MAX_FEE_AMOUNT,
-            collection_threshold: 100_000_000,
-            fees_enabled: true,
-        };
+        env.ledger().with_mut(|ledger| ledger.timestamp = 109);
 
-        assert_eq!(
-            FeesContract::queue_fee_config(
-                &env,
-                &admin,
-                config,
-                MIN_TIMELOCK_SECONDS - 1,
-            ),
-            Err(ContractError::InvalidInput)
-        );
+        assert!(check_fee_timelock(&env, 100, 10));
+
+        env.ledger().with_mut(|ledger| ledger.timestamp = 110);
+        assert!(!check_fee_timelock(&env, 100, 10));
     }
 }

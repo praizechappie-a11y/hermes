@@ -92,4 +92,62 @@ resubmit. The SDK recovery strategy for the oracle-specific codes is
 | `401` | `InvalidInput` | One or more parameters failed validation. |
 | `494` | `InvalidState` | Contract or market is in an unexpected/illegal state. |
 
-> For the complete list of all 100+ error codes see `src/err.rs`.
+> This table lists only the error codes that are reachable from production
+> entrypoints. Codes that have been deprecated and pruned are listed in the
+> [Deprecated codes](#deprecated-codes) section below.
+
+---
+
+## Error-variant lifecycle policy
+
+The error catalog is a public ABI surface: client SDKs match on the numeric
+discriminants. To keep the catalog bounded and meaningful, every variant
+follows the lifecycle below.
+
+### Adding a new code
+
+1. A new variant may only be added when it is reachable from at least one
+   production entrypoint (or a validator invoked by one) and when no existing
+   variant already expresses the same condition.
+2. New variants take the next unused discriminant within their range
+   (`1xx` market, `2xx` oracle, `3xx` validation, `4xx` input/state). Gaps left
+   by pruned codes are **never** filled.
+3. The variant must be added to the Full Error Table above with its code, name,
+   description, and the entrypoints/conditions that produce it.
+4. The variant must have a corresponding `RecoveryStrategy` mapping so SDKs can
+   react deterministically.
+
+### Deprecating a code
+
+1. A variant is a deprecation candidate when it is unreachable from every
+   production entrypoint (e.g. the code path was removed or refactored).
+2. Deprecated variants are marked `#[deprecated]` in `err.rs` and moved to the
+   [Deprecated codes](#deprecated-codes) table, retaining their original
+   discriminant and description.
+3. Deprecated variants remain in the contract for at least one release cycle so
+   that existing SDKs continue to compile and decode them.
+
+### Removing a code
+
+1. After the deprecation window, an unreachable variant is removed from
+   `err.rs` and from the Deprecated codes table.
+2. Removal is recorded in the changelog. The discriminant is retired: it is
+   never renumbered and never reused for a different condition.
+
+### Stability guarantee
+
+- Existing discriminants are **never renumbered**.
+- Retired discriminants are **never reused** for a different error condition.
+- Removing a variant is a breaking change for SDKs only if they matched on it
+  explicitly; the numeric value will simply no longer be produced.
+
+---
+
+## Deprecated codes
+
+The following codes have been deprecated and are scheduled for removal. They
+are retained here (and in `err.rs`) for the deprecation window only.
+
+| Code | Name | Reason |
+|---|---|---|
+| _(none currently)_ | | |

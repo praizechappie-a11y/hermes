@@ -124,6 +124,21 @@ fn action_strategy() -> impl Strategy<Value = BettingAction> {
     ]
 }
 
+/// Generate multiple bets with distinct bettor IDs, amounts, and outcomes.
+/// IDs are materialized as Soroban addresses inside the test environment.
+fn concurrent_bets_strategy() -> impl Strategy<Value = Vec<(usize, i128, bool)>> {
+    prop_vec(
+        (1_000_000i128..=10_000_000i128, any::<bool>()),
+        1..=40,
+    )
+    .prop_map(|bets| {
+        bets.into_iter()
+            .enumerate()
+            .map(|(bettor_id, (amount, is_yes))| (bettor_id, amount, is_yes))
+            .collect()
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // §3  Execution engine
 // ─────────────────────────────────────────────────────────────────────────────
@@ -578,6 +593,93 @@ proptest! {
 
         prop_assert_eq!(ev.net_payout, ev.gross_payout - ev.fee_paid, "INV-5 payout arithmetic");
         prop_assert!(ev.net_payout >= 0, "net_payout must be non-negative");
+    }
+
+    /// **Concurrent-bet pool accounting.**
+    ///
+    /// A generated sequence of distinct bettors placing bets on either
+    /// outcome must produce aggregate stats matching the sum of all stakes.
+    #[test]
+    fn concurrent_bets_match_total_and_outcome_pools(
+        bets in concurrent_bets_strategy()
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| {
+            li.max_entry_ttl = 6_000_000;
+            li.min_persistent_entry_ttl = 1;
+            li.min_temp_entry_ttl = 1;
+        });
+
+        let market_id = Symbol::new(&env, "mkt_conc");
+        let bettors: Vec<Address> = bets
+            .iter()
+            .map(|_| Address::generate(&env))
+            .collect();
+        let mut total_pool = 0i128;
+        let mut outcome_pools = [0i128; 2];
+
+        for (bet_index, (bettor_id, amount, is_yes)) in bets.iter().enumerate() {
+            let bettor = bettors[*bettor_id].clone();
+            let outcome = soroban_sdk::String::from_str(
+                &env,
+                if *is_yes { "yes" } else { "no" },
+            );
+            total_pool += amount;
+            let outcome_index = if *is_yes { 0 } else { 1 };
+            outcome_pools[outcome_index] += amount;
+
+            BettingEventEmitter::emit_bet_created(
+                &env,
+                &market_id,
+                &bettor,
+                &outcome,
+                *amount,
+                0,
+            );
+            BettingEventEmitter::emit_bet_stats_updated(
+                &env,
+                &market_id,
+                (bet_index + 1) as u64,
+                total_pool,
+                (bet_index + 1) as u32,
+            );
+
+            let events = env.events().all();
+            let created: BetCreatedEvent = events
+                .get(events.len() - 2)
+                .unwrap()
+                .2
+                .try_into_val()
+                .unwrap();
+            let stats: BetStatsUpdatedEvent = events
+                .get(events.len() - 1)
+                .unwrap()
+                .2
+                .try_into_val()
+                .unwrap();
+
+            prop_assert_eq!(created.bettor, bettor);
+            prop_assert_eq!(created.outcome, outcome);
+            prop_assert_eq!(created.amount, *amount);
+            prop_assert_eq!(stats.total_bets, (bet_index + 1) as u64);
+            prop_assert_eq!(stats.total_amount_locked, total_pool);
+            prop_assert_eq!(stats.unique_bettors, (bet_index + 1) as u32);
+        }
+
+        prop_assert_eq!(outcome_pools[0] + outcome_pools[1], total_pool);
+        let expected_total_pool: i128 = bets.iter().map(|(_, amount, _)| *amount).sum();
+        prop_assert_eq!(total_pool, expected_total_pool);
+        let events = env.events().all();
+        let final_stats: BetStatsUpdatedEvent = events
+            .get(events.len() - 1)
+            .unwrap()
+            .2
+            .try_into_val()
+            .unwrap();
+        prop_assert_eq!(final_stats.total_amount_locked, expected_total_pool);
+        prop_assert_eq!(final_stats.total_bets, bets.len() as u64);
+        prop_assert_eq!(final_stats.unique_bettors, bets.len() as u32);
     }
 }
 

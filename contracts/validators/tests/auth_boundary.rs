@@ -15,7 +15,7 @@ use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     Address, Env,
 };
-use validators::{ValidatorsContract, ValidatorsContractClient};
+use validators::{ValidatorError, ValidatorsContract, ValidatorsContractClient};
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -236,6 +236,33 @@ fn test_update_stake_requires_auth_success() {
             assert!(!s.to_lowercase().contains("auth"), "update_stake auth must pass; got: {s}");
         }
     }
+}
+
+#[test]
+fn test_update_stake_enforces_inclusive_min_and_max_bounds() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+
+    assert_eq!(
+        ts.client.try_update_stake(&ts.validator, &MIN_STAKE),
+        Ok(Ok(())),
+        "stake exactly at min_stake should succeed"
+    );
+    assert_eq!(
+        ts.client.try_update_stake(&ts.validator, &(MIN_STAKE - 1)),
+        Ok(Err(ValidatorError::StakeTooLow)),
+        "stake below min_stake should fail"
+    );
+    assert_eq!(
+        ts.client.try_update_stake(&ts.validator, &MAX_STAKE),
+        Ok(Ok(())),
+        "stake exactly at max_stake should succeed"
+    );
+    assert_eq!(
+        ts.client.try_update_stake(&ts.validator, &(MAX_STAKE + 1)),
+        Ok(Err(ValidatorError::StakeTooHigh)),
+        "stake above max_stake should fail"
+    );
 }
 
 // ===========================================================================
@@ -471,6 +498,35 @@ fn test_double_register_fails() {
 
     let result = ts.client.try_register_validator(&ts.validator, &INIT_STAKE);
     assert!(result.is_err(), "duplicate registration must fail");
+}
+
+#[test]
+fn test_list_validators_preserves_order_and_paginates() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+    let second = Address::generate(&env);
+    let third = Address::generate(&env);
+
+    ts.client.register_validator(&second, &INIT_STAKE);
+    ts.client.register_validator(&third, &INIT_STAKE);
+
+    let first_page = ts.client.list_validators(&0, &2);
+    assert_eq!(first_page.len(), 2);
+    assert_eq!(first_page.get(0).unwrap(), ts.validator);
+    assert_eq!(first_page.get(1).unwrap(), second);
+
+    let second_page = ts.client.list_validators(&1, &2);
+    assert_eq!(second_page.len(), 2);
+    assert_eq!(second_page.get(0).unwrap(), second);
+    assert_eq!(second_page.get(1).unwrap(), third);
+    assert_eq!(ts.client.list_validators(&3, &2).len(), 0);
+    assert_eq!(ts.client.list_validators(&0, &0).len(), 0);
+
+    ts.client.deregister_validator(&second);
+    let remaining = ts.client.list_validators(&0, &3);
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(remaining.get(0).unwrap(), ts.validator);
+    assert_eq!(remaining.get(1).unwrap(), third);
 }
 
 /// Deregistering an unknown address should return ValidatorNotFound.

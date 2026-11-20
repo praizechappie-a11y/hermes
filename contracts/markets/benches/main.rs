@@ -88,6 +88,7 @@ fn bench_contract_create_market(c: &mut Criterion) {
                 &end_time,
                 &resolution_source,
                 &outcome_tags,
+                &black_box(1i128),
             ))
         })
     });
@@ -120,12 +121,95 @@ fn bench_contract_place_bet(c: &mut Criterion) {
         &end_time,
         &resolution_source,
         &outcome_tags,
+        &1i128,
     );
 
     c.bench_function("contract_place_bet", |b| {
         b.iter(|| {
             black_box(client.place_bet(&user, &market_id, &0u32, &black_box(500i128)))
         })
+    });
+}
+
+fn bench_contract_set_market_payout_curve(c: &mut Criterion) {
+    let env = Env::default();
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    env.mock_all_auths();
+
+    let question = String::from_str(&env, "Will DOT reach $100?");
+    let description = String::from_str(&env, "Polkadot prediction market");
+    let resolution_source = String::from_str(&env, "CoinGecko");
+    let outcome_tags = Vec::from_array(
+        &env,
+        [
+            String::from_str(&env, "Yes"),
+            String::from_str(&env, "No"),
+        ],
+    );
+    let end_time: u64 = 1_800_000_000;
+
+    let market_id = client.create_market(
+        &creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+        &1i128,
+    );
+
+    c.bench_function("contract_set_market_payout_curve", |b| {
+        b.iter(|| {
+            black_box(client.set_market_payout_curve(
+                &creator,
+                &market_id,
+                &black_box(1u32),
+            ))
+        })
+    });
+}
+
+fn bench_contract_propose_pause(c: &mut Criterion) {
+    let env = Env::default();
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    c.bench_function("contract_propose_pause", |b| {
+        b.iter(|| black_box(client.propose_pause(&admin, &black_box(true))))
+    });
+}
+
+fn bench_contract_approve_pause(c: &mut Criterion) {
+    let env = Env::default();
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    // A pause proposal must exist before it can be approved.
+    client.propose_pause(&admin, &true);
+
+    c.bench_function("contract_approve_pause", |b| {
+        b.iter(|| black_box(client.approve_pause(&admin)))
+    });
+}
+
+fn bench_contract_execute_pause(c: &mut Criterion) {
+    let env = Env::default();
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    // A pause proposal must exist before it can be executed.
+    client.propose_pause(&admin, &true);
+
+    c.bench_function("contract_execute_pause", |b| {
+        b.iter(|| black_box(client.execute_pause(&admin)))
     });
 }
 
@@ -158,6 +242,7 @@ fn bench_contract_resolve_market(c: &mut Criterion) {
                 &end_time,
                 &resolution_source,
                 &outcome_tags,
+                &1i128,
             );
             black_box(client.resolve_market(&creator, &market_id, &0u32))
         })
@@ -172,6 +257,10 @@ criterion_group!(
     bench_claim_winnings,
     bench_contract_create_market,
     bench_contract_place_bet,
+    bench_contract_set_market_payout_curve,
+    bench_contract_propose_pause,
+    bench_contract_approve_pause,
+    bench_contract_execute_pause,
     bench_contract_resolve_market,
 );
 criterion_main!(benches);

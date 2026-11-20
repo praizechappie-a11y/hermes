@@ -2,6 +2,7 @@
 
 use markets::{ContractError, MarketsContract, MarketsContractClient, PayoutCurveConfig};
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Ledger},
     Address, Env, String, Vec,
 };
@@ -76,6 +77,7 @@ fn create_standard_market(te: &TestEnv, num_outcomes: u32) -> u32 {
         &(te.env.ledger().timestamp() + 86400),
         &String::from_str(&te.env, "OracleSource"),
         &outcome_tags,
+        &1i128,
     )
 }
 
@@ -297,6 +299,36 @@ fn test_user_bet_enumeration_and_pagination() {
     assert!(claimed_b1.claimed);
 }
 
+#[test]
+fn test_user_bet_enumeration_reflects_market_cancellation() {
+    let te = setup_test_env();
+
+    let m1 = create_standard_market(&te, 2);
+    let m2 = create_standard_market(&te, 2);
+
+    te.client.place_bet(&te.bettor1, &m1, &0, &500);
+    te.client.place_bet(&te.bettor1, &m2, &1, &300);
+
+    // Before cancellation both bets show market_cancelled = false
+    let before = te.client.get_user_bets(&te.bettor1, &0, &10);
+    assert_eq!(before.len(), 2);
+    assert!(!before.get(0).unwrap().market_cancelled);
+    assert!(!before.get(1).unwrap().market_cancelled);
+
+    // Cancel m1
+    te.client.cancel_market(&te.creator, &m1);
+
+    // After cancellation the m1 entry must be flagged; m2 must remain unflagged
+    let after = te.client.get_user_bets(&te.bettor1, &0, &10);
+    assert_eq!(after.len(), 2);
+    let entry_m1 = after.get(0).unwrap();
+    let entry_m2 = after.get(1).unwrap();
+    assert_eq!(entry_m1.market_id, m1);
+    assert!(entry_m1.market_cancelled, "cancelled market must be flagged");
+    assert_eq!(entry_m2.market_id, m2);
+    assert!(!entry_m2.market_cancelled, "live market must not be flagged");
+}
+
 // ===========================================================================
 //  ISSUE #014: CONFIGURABLE PAYOUT CURVES TESTS
 // ===========================================================================
@@ -305,6 +337,8 @@ fn test_user_bet_enumeration_and_pagination() {
 fn test_default_winner_takes_all_payout() {
     let te = setup_test_env();
     let m1 = create_standard_market(&te, 2);
+    let token_client = soroban_sdk::token::Client::new(&te.env, &te.token_address);
+    let starting_balance = token_client.balance(&te.bettor1);
 
     // Bettor1 stakes 200 on Outcome 0 (Yes)
     // Bettor2 stakes 600 on Outcome 1 (No)
@@ -320,6 +354,7 @@ fn test_default_winner_takes_all_payout() {
 
     let payout = te.client.claim_winnings(&te.bettor1, &m1);
     assert_eq!(payout, 800);
+    assert_eq!(token_client.balance(&te.bettor1), starting_balance - 200 + payout);
 
     // Losing bettor gets error
     let lose_res = te.client.try_claim_winnings(&te.bettor2, &m1);
@@ -433,6 +468,7 @@ fn test_tiered_payout_with_runner_up_credit() {
         &String::from_str(&te.env, "Oracle"),
         &tags,
         &tiered_curve,
+        &1i128,
     );
 
     // Wagers:
@@ -488,6 +524,7 @@ fn test_custom_weights_payout() {
         &String::from_str(&te.env, "Oracle"),
         &tags,
         &curve,
+        &1i128,
     );
 
     te.client.place_bet(&te.bettor1, &m_id, &0, &500);
@@ -521,6 +558,7 @@ fn test_invalid_payout_curves_rejected() {
         &String::from_str(&te.env, "S"),
         &tags,
         &bad_tiered,
+        &1i128,
     );
     assert_eq!(
         res.unwrap_err().unwrap(),
@@ -540,11 +578,98 @@ fn test_invalid_payout_curves_rejected() {
         &String::from_str(&te.env, "S"),
         &tags,
         &bad_custom,
+        &1i128,
     );
     assert_eq!(
         res2.unwrap_err().unwrap(),
         ContractError::InvalidPayoutCurve.into()
     );
+}
+
+#[test]
+fn test_custom_weights_exactly_10000_required() {
+    let te = setup_test_env();
+
+    let mut tags = Vec::new(&te.env);
+    tags.push_back(String::from_str(&te.env, "A"));
+    tags.push_back(String::from_str(&te.env, "B"));
+
+    // Test 1: Custom weights summing to 9_999 (less than 10_000) must be rejected
+    let mut under_weights = Vec::new(&te.env);
+    under_weights.push_back(5000);
+    under_weights.push_back(4999); // sum = 9_999 < 10_000
+    let under_custom = PayoutCurveConfig::custom_weights(under_weights);
+    let res_under = te.client.try_create_market_with_curve(
+        &te.creator,
+        &String::from_str(&te.env, "Q"),
+        &String::from_str(&te.env, "D"),
+        &1000000,
+        &String::from_str(&te.env, "S"),
+        &tags,
+        &under_custom,
+        &1i128,
+    );
+    assert_eq!(
+        res_under.unwrap_err().unwrap(),
+        ContractError::InvalidPayoutCurve.into()
+    );
+
+    // Test 2: Custom weights summing to 5_000 (50% of pool) must be rejected
+    let mut half_weights = Vec::new(&te.env);
+    half_weights.push_back(2500);
+    half_weights.push_back(2500); // sum = 5_000 < 10_000
+    let half_custom = PayoutCurveConfig::custom_weights(half_weights);
+    let res_half = te.client.try_create_market_with_curve(
+        &te.creator,
+        &String::from_str(&te.env, "Q"),
+        &String::from_str(&te.env, "D"),
+        &1000000,
+        &String::from_str(&te.env, "S"),
+        &tags,
+        &half_custom,
+        &1i128,
+    );
+    assert_eq!(
+        res_half.unwrap_err().unwrap(),
+        ContractError::InvalidPayoutCurve.into()
+    );
+
+    // Test 3: Custom weights summing to 1 must be rejected
+    let mut one_weight = Vec::new(&te.env);
+    one_weight.push_back(1);
+    one_weight.push_back(0); // sum = 1 < 10_000
+    let one_custom = PayoutCurveConfig::custom_weights(one_weight);
+    let res_one = te.client.try_create_market_with_curve(
+        &te.creator,
+        &String::from_str(&te.env, "Q"),
+        &String::from_str(&te.env, "D"),
+        &1000000,
+        &String::from_str(&te.env, "S"),
+        &tags,
+        &one_custom,
+        &1i128,
+    );
+    assert_eq!(
+        res_one.unwrap_err().unwrap(),
+        ContractError::InvalidPayoutCurve.into()
+    );
+
+    // Test 4: Custom weights summing to exactly 10_000 must succeed
+    let mut exact_weights = Vec::new(&te.env);
+    exact_weights.push_back(6000);
+    exact_weights.push_back(4000); // sum = 10_000 (exactly!)
+    let exact_custom = PayoutCurveConfig::custom_weights(exact_weights);
+    let res_exact = te.client.try_create_market_with_curve(
+        &te.creator,
+        &String::from_str(&te.env, "Exact weights?"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &tags,
+        &exact_custom,
+        &1i128,
+    );
+    assert!(res_exact.is_ok(), "Weights summing to 10_000 should be accepted");
 }
 
 // ===========================================================================
@@ -640,4 +765,324 @@ fn test_withdrawal_exact_boundary_cases() {
     assert_eq!(dust_res.net_amount, 50);
     assert_eq!(dust_res.fee_deducted, 0);
     assert_eq!(te.client.get_user_balance(&te.bettor2), 0);
+}
+
+// ===========================================================================
+//  MIN BET VALIDATION TESTS
+// ===========================================================================
+
+#[test]
+fn test_create_market_rejects_zero_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let res = te.client.try_create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Will it happen?"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &0i128,
+    );
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::InvalidConfig.into()
+    );
+}
+
+#[test]
+fn test_create_market_rejects_negative_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let res = te.client.try_create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Will it happen?"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &-1i128,
+    );
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::InvalidConfig.into()
+    );
+}
+
+#[test]
+fn test_place_bet_rejects_dust_below_min_bet() {
+    let te = setup_test_env();
+
+    // Create a market with min_bet = 1_000 stroops
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Dust protection test"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &1_000i128,
+    );
+
+    // 999 stroops is below the 1_000 min_bet — must be rejected
+    let res = te.client.try_place_bet(&te.bettor1, &market_id, &0, &999i128);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::StakeTooSmall.into()
+    );
+
+    // 1 stroop is also below min_bet — historically valid but now rejected
+    let res2 = te.client.try_place_bet(&te.bettor1, &market_id, &0, &1i128);
+    assert_eq!(
+        res2.unwrap_err().unwrap(),
+        ContractError::StakeTooSmall.into()
+    );
+}
+
+#[test]
+fn test_place_bet_accepts_amount_at_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Exact min_bet test"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &1_000i128,
+    );
+
+    // Exactly 1_000 stroops must succeed
+    let res = te.client.try_place_bet(&te.bettor1, &market_id, &0, &1_000i128);
+    assert!(res.is_ok(), "Bet at exactly min_bet should be accepted");
+}
+
+#[test]
+fn test_place_bet_accepts_amount_above_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Above min_bet test"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &1_000i128,
+    );
+
+    // Well above min_bet must succeed
+    let res = te.client.try_place_bet(&te.bettor1, &market_id, &0, &50_000i128);
+    assert!(res.is_ok(), "Bet above min_bet should be accepted");
+}
+
+#[test]
+fn test_place_bet_still_rejects_zero_even_with_min_bet_one() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    // Market with the smallest valid min_bet (1 stroop)
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Min bet = 1"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &1i128,
+    );
+
+    // Zero is always invalid
+    let res = te.client.try_place_bet(&te.bettor1, &market_id, &0, &0i128);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::StakeTooSmall.into()
+    );
+
+    // Negative is always invalid
+    let res_neg = te.client.try_place_bet(&te.bettor1, &market_id, &0, &-1i128);
+    assert_eq!(
+        res_neg.unwrap_err().unwrap(),
+        ContractError::StakeTooSmall.into()
+    );
+}
+
+#[test]
+fn test_get_market_exposes_min_bet() {
+    let te = setup_test_env();
+
+    let mut outcome_tags = Vec::new(&te.env);
+    outcome_tags.push_back(String::from_str(&te.env, "Yes"));
+    outcome_tags.push_back(String::from_str(&te.env, "No"));
+
+    let market_id = te.client.create_market(
+        &te.creator,
+        &String::from_str(&te.env, "Read min_bet test"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &outcome_tags,
+        &5_000i128,
+    );
+
+    let market = te.client.get_market(&market_id).unwrap();
+    assert_eq!(market.min_bet, 5_000i128);
+}
+
+// ===========================================================================
+//  ISSUE #339: RE-ENTRANCY DOUBLE-CLAIM PROTECTION
+// ===========================================================================
+
+/// Mock token contract that attempts to re-enter `claim_winnings` on the
+/// markets contract during the payout transfer hook.
+#[contract]
+pub struct ReentrantToken;
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn try_reenter(env: Env, markets: Address, bettor: Address, market_id: u32) {
+        // Attempt a second claim while the first claim is mid-transfer.
+        // The markets contract must reject this with AlreadyClaimed.
+        let client = MarketsContractClient::new(&env, &markets);
+        let res = client.try_claim_winnings(&bettor, &market_id);
+        match res {
+            Err(Ok(err)) => {
+                assert_eq!(err, ContractError::AlreadyClaimed);
+            }
+            _ => panic!("re-entrant claim must be rejected with AlreadyClaimed"),
+        }
+    }
+}
+
+#[test]
+fn test_reentrant_claim_winnings_rejected_with_already_claimed() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 2);
+
+    te.client.place_bet(&te.bettor1, &market_id, &0, &500);
+    te.client.place_bet(&te.bettor2, &market_id, &1, &500);
+    te.client.resolve_market(&te.creator, &market_id, &0);
+
+    // First claim succeeds; the claimed flag is set inside the loop before
+    // the transfer, so any re-entrant attempt sees AlreadyClaimed.
+    let payout = te.client.claim_winnings(&te.bettor1, &market_id);
+    assert_eq!(payout, 1000);
+
+    // A second direct claim is also rejected.
+    let second = te.client.try_claim_winnings(&te.bettor1, &market_id);
+    assert_eq!(
+        second.unwrap_err().unwrap(),
+        ContractError::AlreadyClaimed.into()
+    );
+}
+
+// ===========================================================================
+//  ISSUE #340: ZERO-WEIGHT PAYOUT CURVE REJECTION
+// ===========================================================================
+
+#[test]
+fn test_zero_weight_custom_curve_rejected() {
+    let te = setup_test_env();
+
+    let mut tags = Vec::new(&te.env);
+    tags.push_back(String::from_str(&te.env, "A"));
+    tags.push_back(String::from_str(&te.env, "B"));
+
+    // All outcome weights are zero -> total weight is zero.
+    let mut zero_weights = Vec::new(&te.env);
+    zero_weights.push_back(0);
+    zero_weights.push_back(0);
+    let zero_curve = PayoutCurveConfig::custom_weights(zero_weights);
+
+    let res = te.client.try_create_market_with_curve(
+        &te.creator,
+        &String::from_str(&te.env, "Zero weights?"),
+        &String::from_str(&te.env, "Desc"),
+        &(te.env.ledger().timestamp() + 86400),
+        &String::from_str(&te.env, "Oracle"),
+        &tags,
+        &zero_curve,
+        &1i128,
+    );
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::InvalidPayoutCurve.into()
+    );
+}
+
+// ===========================================================================
+//  ISSUE #342: LP REWARD UNDERFLOW PROTECTION
+// ===========================================================================
+
+#[test]
+fn test_remove_liquidity_after_reward_index_reset() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 2);
+
+    te.client.add_liquidity(&te.admin1, &market_id, &100);
+    te.client.place_bet(&te.bettor1, &market_id, &0, &100);
+    te.client.place_bet(&te.bettor2, &market_id, &1, &900);
+    te.client.resolve_market(&te.creator, &market_id, &0);
+    te.client.claim_winnings(&te.bettor1, &market_id);
+
+    // Removing liquidity must not underflow even if the global reward index
+    // is reset below the provider's stored debt. The contract must return a
+    // meaningful error (InvalidState) rather than Overflow.
+    let res = te.client.try_remove_liquidity(&te.admin1, &market_id, &100);
+    match res {
+        Ok(_) => {}
+        Err(Ok(err)) => {
+            assert_eq!(err, ContractError::InvalidState);
+        }
+        Err(_) => panic!("unexpected host error"),
+    }
+}
+
+// ===========================================================================
+//  ISSUE #347: MARKET_PAYOUT_CURVE_TTL_LEDGERS CONFIGURATION
+// ===========================================================================
+
+#[test]
+fn test_initialize_rejects_insufficient_max_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1735689600);
+
+    // Force the network max TTL below MARKET_PAYOUT_CURVE_TTL_LEDGERS
+    // (~1 year = 6_307_200 ledgers) so initialization must reject the config.
+    env.storage().set_max_ttl(1_000);
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+
+    let res = client.try_initialize(&admin);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        ContractError::InvalidConfig.into()
+    );
 }
